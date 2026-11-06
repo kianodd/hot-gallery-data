@@ -1,0 +1,774 @@
+name: hg-upload
+run-name: hg-upload-${{ inputs.job }}
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Direct video URL"
+        required: false
+        default: ""
+        type: string
+      mode:
+        description: "upload | preview | youtube (preview = backfill GIF preview for an existing item; youtube = yt-dlp 360p download)"
+        required: false
+        default: "upload"
+        type: string
+      item:
+        description: "Item id"
+        required: true
+        type: string
+      job:
+        description: "Queue job id"
+        required: true
+        type: string
+      skip_index:
+        description: "1 = shard mode: commit media only, never index.json; the entry is exported in progress for the worker to merge into the main repo index"
+        required: false
+        default: ""
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: hg-upload-${{ inputs.item }}
+  cancel-in-progress: false
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout (sparse)
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            index.json
+            media/${{ inputs.item }}
+            media/${{ inputs.item }}.json
+            media/${{ inputs.item }}.thumb.jpg
+            media/${{ inputs.item }}.preview.gif
+            progress
+          sparse-checkout-cone-mode: false
+      - name: Write preview generator
+        run: |
+          cat > /tmp/gen_preview.py <<'GENEOF'
+          import os, shutil, subprocess, sys
+          video, out = sys.argv[1], sys.argv[2]
+          def run(cmd):
+              return subprocess.run(cmd, capture_output=True)
+          r = run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', video])
+          try:
+              dur = float(r.stdout.decode().strip())
+          except Exception:
+              dur = 0
+          if dur <= 0:
+              print('preview: no duration'); sys.exit(1)
+          os.makedirs('/tmp/prev', exist_ok=True)
+          def luma(t):
+              p = '/tmp/prev/luma.raw'
+              rc = run(['ffmpeg', '-v', 'error', '-ss', '%.2f' % t, '-i', video, '-frames:v', '1',
+                        '-vf', 'scale=16:16', '-pix_fmt', 'gray', '-f', 'rawvideo', p, '-y'])
+              if rc.returncode != 0 or not os.path.exists(p):
+                  return (0, 0)
+              data = open(p, 'rb').read()
+              if not data:
+                  return (0, 0)
+              return (sum(data) / len(data), max(data))
+          def frame_at(t, outp):
+              rc = run(['ffmpeg', '-v', 'error', '-ss', '%.2f' % t, '-i', video, '-frames:v', '1',
+                        '-vf', 'scale=320:-2', outp, '-y'])
+              return rc.returncode == 0 and os.path.exists(outp) and os.path.getsize(outp) > 0
+          chosen = []
+          for i in range(10):
+              pct = 5 + i * 10
+              best = None; bestl = -1
+              for off in [0, 3, -3, 6, -6, 10, -10]:
+                  p2 = min(99, max(1, pct + off)); t = dur * p2 / 100.0
+                  mean, mx = luma(t)
+                  if mean >= 20 and mx > 40:
+                      best = t; break
+                  if mean > bestl:
+                      bestl = mean; best = t
+              chosen.append(best)
+              print('preview frame %d: pct=%d t=%.2f' % (i, pct, best))
+          for i, t in enumerate(chosen):
+              fp = '/tmp/prev/f%02d.png' % i
+              if not frame_at(t, fp):
+                  if i > 0:
+                      shutil.copy('/tmp/prev/f%02d.png' % (i - 1), fp)
+                  elif not frame_at(dur * 0.5, fp):
+                      print('preview: frame extraction failed'); sys.exit(1)
+          def make_gif(w, colors, outp):
+              fc = ('[0:v]scale=%d:-2:flags=lanczos,split[x][y];[x]palettegen=max_colors=%d[p];'
+                    '[y][p]paletteuse=dither=bayer:bayer_scale=4' % (w, colors))
+              rc = run(['ffmpeg', '-v', 'error', '-framerate', '10/7', '-i', '/tmp/prev/f%02d.png',
+                        '-filter_complex', fc, outp, '-y'])
+              return rc.returncode == 0 and os.path.exists(outp) and os.path.getsize(outp) > 0
+          ok = False
+          for (w, c) in [(320, 128), (256, 96), (224, 80)]:
+              if make_gif(w, c, out):
+                  sz = os.path.getsize(out)
+                  print('preview gif: w=%d colors=%d size=%d' % (w, c, sz))
+                  ok = True
+                  if sz <= 1572864:
+                      break
+          if not ok:
+              sys.exit(1)
+          print('preview done:', out, os.path.getsize(out), 'bytes')
+          GENEOF
+          python3 -c "import ast; ast.parse(open('/tmp/gen_preview.py').read()); print('gen_preview.py ok')"
+          cat > /tmp/git-safe.sh <<'GSEOF'
+          export GIT_TERMINAL_PROMPT=0
+          gf() { timeout --kill-after=10 180 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 fetch "$@"; }
+          gp() { timeout --kill-after=10 600 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 push "$@"; }
+          GSEOF
+      - name: Backfill preview for existing item
+        if: ${{ inputs.mode == 'preview' }}
+        env:
+          ITEM: ${{ inputs.item }}
+          SKIP_INDEX: ${{ inputs.skip_index }}
+        run: |
+          set -euo pipefail
+          git config user.name "hot-gallery"
+          git config user.email "actions@users.noreply.github.com"
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then echo "ffmpeg/ffprobe missing; installing"; sudo apt-get update -qq >/dev/null 2>&1 || true; sudo apt-get install -y -qq ffmpeg >/dev/null 2>&1 || true; fi
+          . /tmp/git-safe.sh
+          python3 - "$ITEM" <<'PYEOF'
+          import json, os, sys
+          item = sys.argv[1]
+          man = json.load(open("media/%s.json" % item))
+          parts = man["parts"]
+          with open("/tmp/video.bin", "wb") as out:
+              for part in parts:
+                  with open(part["path"], "rb") as f:
+                      while True:
+                          chunk = f.read(8 * 1024 * 1024)
+                          if not chunk:
+                              break
+                          out.write(chunk)
+          sz = os.path.getsize("/tmp/video.bin")
+          print("assembled", sz, "expected", man["size"])
+          assert sz == man["size"], "assembled size mismatch"
+          PYEOF
+          PREVIEW="media/$ITEM.preview.gif"
+          python3 /tmp/gen_preview.py /tmp/video.bin "$PREVIEW"
+          test -s "$PREVIEW"
+          pushed=0
+          for try in $(seq 1 10); do
+            gf origin main || true
+            git show origin/main:index.json > /tmp/index.json || echo '{"photos":[]}' > /tmp/index.json
+            if [ -z "$SKIP_INDEX" ]; then
+          python3 - "$ITEM" "$PREVIEW" <<'PYEOF'
+          import json, sys
+          item, preview = sys.argv[1], sys.argv[2]
+          idx = json.load(open("/tmp/index.json"))
+          hit = False
+          for entry in idx["photos"]:
+              if entry.get("id") == item:
+                  entry["preview"] = preview
+                  hit = True
+          assert hit, "item not in index"
+          json.dump(idx, open("/tmp/index_new.json", "w"), indent=1, ensure_ascii=False)
+          print("index updated with preview for", item)
+          PYEOF
+          else echo '{"photos":[]}' > /tmp/index_new.json; fi
+            BLOB_P=$(git hash-object -w "$PREVIEW")
+            BLOB_I=$(git hash-object -w /tmp/index_new.json)
+            export GIT_INDEX_FILE=/tmp/hg_idx_preview
+            rm -f "$GIT_INDEX_FILE"
+            git read-tree origin/main
+            git update-index --add --cacheinfo "100644,$BLOB_P,$PREVIEW"
+            if [ -z "$SKIP_INDEX" ]; then git update-index --add --cacheinfo "100644,$BLOB_I,index.json"; fi
+            TREE=$(git write-tree)
+            if [ "$TREE" = "$(git rev-parse origin/main^{tree})" ]; then pushed=1; unset GIT_INDEX_FILE; break; fi
+            COMMIT=$(git commit-tree "$TREE" -p origin/main -m "preview $ITEM")
+            unset GIT_INDEX_FILE
+            if gp origin "$COMMIT:main"; then pushed=1; break; fi
+            echo "push raced, retrying with jitter"
+            sleep $((1 + RANDOM % 6))
+          done
+          if [ "$pushed" = "0" ]; then echo "preview push failed"; exit 1; fi
+          echo "preview backfill done: $ITEM"
+      - name: Set up Deno (YouTube JS runtime for yt-dlp)
+        if: ${{ inputs.mode == 'youtube' }}
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Download YouTube video (Invidious-first 360p)
+        if: ${{ inputs.mode == 'youtube' }}
+        env:
+          SRC: ${{ inputs.url }}
+          ITEM: ${{ inputs.item }}
+          JOB: ${{ inputs.job }}
+        run: |
+          set -euo pipefail
+          # hg-v20 (یوتیوب): اول اینویدیوس (چند نمونه به‌ترتیب)، yt-dlp فقط آخرین راه‌حلِ محدود — دانلود با yt-dlp — ویدیو حداکثر 360p، صدا در خروجی نهایی AAC با بیت‌ریت 128k.
+          # عنوان، نام کانال و آی‌دی در /tmp/yt_meta.json ذخیره می‌شود تا در مانیفست و ایندکس بنشیند؛
+          # تامنیل رسمی یوتیوب هم به /tmp/yt_thumb.jpg می‌رود و جلوتر جای تامنیل فریمی را می‌گیرد.
+          if true; then
+            echo "youtube mode: yt-dlp download for $SRC"
+            if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then echo "ffmpeg/ffprobe missing; installing"; sudo apt-get update -qq >/dev/null 2>&1 || true; sudo apt-get install -y -qq ffmpeg >/dev/null 2>&1 || true; fi
+            command -v ffmpeg ffprobe
+            YTOK=0
+            echo "invidious-first download for $SRC"
+              python3 - <<'PYEOF'
+          import json, os, re, subprocess, sys, urllib.request
+          SRC = os.environ.get("SRC", "")
+          m = re.search(r"[?&]v=([\w-]{6,20})", SRC) or re.search(r"youtu\.be/([\w-]{6,20})", SRC)
+          vid = m.group(1) if m else ""
+          print("invidious fallback for video id:", vid)
+          def dl(url, out):
+              r = subprocess.run(["curl", "-fsSL", "--max-time", "300", "--speed-limit", "20480", "--speed-time", "30", "--retry", "3", "--retry-delay", "2", "-A", "Mozilla/5.0", "-o", out, url], capture_output=True)
+              return r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 50000
+          done = False
+          if vid:
+              for base in ["https://yt.chocolatemoo53.com", "https://inv.tiekoetter.com", "https://invidious.privacyredirect.com", "https://yewtu.be", "https://inv.nadeko.net", "https://invidious.fdn.fr", "https://inv.us.projectsegfau.lt", "https://invidious.0011.lt"]:
+                  try:
+                      req = urllib.request.Request(base + "/api/v1/videos/" + vid + "?local=true", headers={"User-Agent": "Mozilla/5.0"})
+                      with urllib.request.urlopen(req, timeout=25) as resp:
+                          info = json.load(resp)
+                      ad = info.get("adaptiveFormats") or []
+                      vids = [f for f in ad if str(f.get("type", "")).startswith("video/")]
+                      auds = [f for f in ad if str(f.get("type", "")).startswith("audio/")]
+                      if not vids or not auds:
+                          print(base, ": no adaptive formats"); continue
+                      def pick_v(fs):
+                          for it in ("134", "18"):
+                              for f in fs:
+                                  if str(f.get("itag")) == it: return f
+                          c = [f for f in fs if f.get("qualityLabel") == "360p" and "mp4" in str(f.get("type"))]
+                          if c: return c[0]
+                          c = [f for f in fs if "mp4" in str(f.get("type")) and (f.get("qualityLabel") or "") <= "360p"]
+                          return c[0] if c else fs[0]
+                      def pick_a(fs):
+                          for f in fs:
+                              if str(f.get("itag")) == "140": return f
+                          mp = [f for f in fs if "mp4" in str(f.get("type"))]
+                          if mp: return min(mp, key=lambda f: abs(int(f.get("bitrate") or 0) - 128000))
+                          return fs[0]
+                      vf, af = pick_v(vids), pick_a(auds)
+                      print(base, ": video itag", vf.get("itag"), vf.get("qualityLabel"), "| audio itag", af.get("itag"), af.get("bitrate"))
+                      if not dl(vf["url"], "/tmp/yt_v.bin"): print(base, ": video download failed"); continue
+                      if not dl(af["url"], "/tmp/yt_a.bin"): print(base, ": audio download failed"); continue
+                      is_mp4 = "mp4" in str(vf.get("type"))
+                      merged = "/tmp/ytv.mp4" if is_mp4 else "/tmp/ytv.mkv"
+                      r = subprocess.run(["ffmpeg", "-v", "error", "-i", "/tmp/yt_v.bin", "-i", "/tmp/yt_a.bin", "-c", "copy", merged, "-y"], capture_output=True)
+                      if r.returncode != 0 or not os.path.exists(merged) or os.path.getsize(merged) < 100000:
+                          print(base, ": merge failed"); continue
+                      meta = {"title": info.get("title") or "", "channel": info.get("author") or "", "id": vid, "duration": int(info.get("lengthSeconds") or 0)}
+                      json.dump(meta, open("/tmp/ytv.info.json", "w"), ensure_ascii=False)
+                      thumbs = info.get("videoThumbnails") or []
+                      turl = ""
+                      for q in ("maxres", "high", "medium"):
+                          for t in thumbs:
+                              if t.get("quality") == q and t.get("url"): turl = t["url"]; break
+                          if turl: break
+                      if not turl and thumbs: turl = thumbs[0].get("url", "")
+                      if turl:
+                          if turl.startswith("/"): turl = base + turl
+                          if dl(turl, "/tmp/yt_t.bin"):
+                              rr = subprocess.run(["ffmpeg", "-v", "error", "-i", "/tmp/yt_t.bin", "-frames:v", "1", "/tmp/ytv.jpg", "-y"], capture_output=True)
+                              if rr.returncode != 0: subprocess.run(["cp", "/tmp/yt_t.bin", "/tmp/ytv.jpg"])
+                      print(base, ": fallback ok ->", merged, os.path.getsize(merged))
+                      done = True; break
+                  except Exception as e:
+                      print(base, ": error", e); continue
+          print("invidious fallback done:", done)
+          PYEOF
+            if [ -f /tmp/ytv.info.json ] && { [ -f /tmp/ytv.mp4 ] || [ -f /tmp/ytv.mkv ] || [ -f /tmp/ytv.webm ]; }; then YTOK=1; echo "invidious succeeded"; fi
+            if [ "$YTOK" != "1" ]; then
+              echo "invidious failed on all instances; bounded yt-dlp last resort"
+            python3 -m pip install --quiet --upgrade "yt-dlp[default]" || pip3 install --quiet --upgrade "yt-dlp[default]"
+            export PATH="$HOME/.local/bin:$PATH"
+            command -v yt-dlp
+            YTFMT='bestvideo[height<=360][vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[height<=360]+bestaudio/best[height<=360]/bestvideo+bestaudio/best'
+              for CLIENT in tv android_vr web_safari; do
+                echo "yt-dlp attempt: player_client=$CLIENT"
+                rm -f /tmp/ytv.mp4 /tmp/ytv.webm /tmp/ytv.mkv /tmp/ytv.info.json /tmp/ytv.jpg /tmp/ytv.webp /tmp/ytv.png
+                if timeout 90 yt-dlp --no-playlist --no-warnings --socket-timeout 15 --retries 1 --fragment-retries 1 --js-runtimes deno --js-runtimes node --extractor-args "youtube:player_client=$CLIENT" -f "$YTFMT" --merge-output-format mp4 --write-info-json --write-thumbnail --convert-thumbnails jpg -o "/tmp/ytv.%(ext)s" "$SRC"; then YTOK=1; break; fi
+                echo "yt-dlp attempt failed for client=$CLIENT"
+                sleep 2
+              done
+            fi
+            if [ "$YTOK" != "1" ]; then echo "youtube download failed: all invidious instances and the bounded yt-dlp last resort"; exit 1; fi
+            python3 - <<'PYEOF'
+          import glob, json, os
+          info = json.load(open("/tmp/ytv.info.json"))
+          meta = {"title": info.get("title") or "", "channel": info.get("channel") or info.get("uploader") or "", "yt_id": info.get("id") or "", "duration": int(info.get("duration") or 0)}
+          json.dump(meta, open("/tmp/yt_meta.json", "w"), ensure_ascii=False)
+          cands = [f for f in glob.glob("/tmp/ytv.*") if os.path.splitext(f)[1].lower() in (".mp4", ".webm", ".mkv") and os.path.getsize(f) > 0]
+          assert cands, "no downloaded media file"
+          raw = max(cands, key=os.path.getsize)
+          open("/tmp/yt_raw_path.txt", "w").write(raw)
+          print("yt meta:", meta)
+          print("yt raw:", raw, os.path.getsize(raw))
+          PYEOF
+            YTRAW=$(cat /tmp/yt_raw_path.txt)
+            VCODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$YTRAW" 2>/dev/null || echo "")
+            echo "yt video codec: $VCODEC"
+            if [ "$VCODEC" = "h264" ]; then
+              ffmpeg -v error -i "$YTRAW" -c:v copy -c:a aac -b:a 128k -movflags +faststart -f mp4 /tmp/video.bin -y
+            else
+              ffmpeg -v error -i "$YTRAW" -c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 128k -movflags +faststart -f mp4 /tmp/video.bin -y
+            fi
+            if [ ! -s /tmp/video.bin ]; then echo "youtube normalize failed"; exit 1; fi
+            if [ -f /tmp/ytv.jpg ]; then ffmpeg -v error -i /tmp/ytv.jpg -vf scale=640:-2 -q:v 4 /tmp/yt_thumb.jpg -y || cp /tmp/ytv.jpg /tmp/yt_thumb.jpg || true; fi
+            echo "youtube download done: $(stat -c %s /tmp/video.bin) bytes"
+            HLS_DONE=1
+          fi
+          touch /tmp/yt_done
+      - name: Upload video in 8MB parts
+        if: ${{ inputs.mode != 'preview' }}
+        env:
+          SRC: ${{ inputs.url }}
+          ITEM: ${{ inputs.item }}
+          JOB: ${{ inputs.job }}
+          SKIP_INDEX: ${{ inputs.skip_index }}
+        run: |
+          set -euo pipefail
+          exec > >(tee -a /tmp/hg_step.log) 2>&1
+          . /tmp/git-safe.sh
+          git config user.name "hot-gallery"
+          git config user.email "actions@users.noreply.github.com"
+          PART=8388608
+          DIR="media/$ITEM"
+          mkdir -p "$DIR" progress
+          ref_for() { printf '%s' "$1" | sed -E 's#^(https?://[^/]+).*#\1/#'; }
+          SRC_REF=$(ref_for "$SRC")
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then echo "ffmpeg/ffprobe missing; installing"; sudo apt-get update -qq >/dev/null 2>&1 || true; sudo apt-get install -y -qq ffmpeg >/dev/null 2>&1 || true; fi
+          command -v ffmpeg ffprobe || true
+          IS_HLS=0; HLS_DONE=0
+          if [ -f /tmp/yt_done ]; then HLS_DONE=1; echo "youtube video prepared by the yt-dlp step"; fi
+          if printf '%s' "$SRC" | grep -qiE '\.m3u8([?&#]|$)'; then IS_HLS=1; fi
+          if [ "$IS_HLS" != "1" ]; then
+            curl -fsSL -e "$SRC_REF" -r 0-1023 -o /tmp/hls_probe.bin "$SRC" 2>/dev/null || true
+            if [ -f /tmp/hls_probe.bin ] && [ "$(head -c 7 /tmp/hls_probe.bin 2>/dev/null)" = "#EXTM3U" ]; then IS_HLS=1; fi
+          fi
+          if [ "$IS_HLS" = "1" ]; then
+            echo "hls source detected; building segment plan"
+            python3 - "$SRC" <<'PYEOF'
+          import os, re, sys, urllib.parse, urllib.request
+          SRC = sys.argv[1]
+          UA = {'User-Agent': 'Mozilla/5.0'}
+          def fail(msg, code, fa):
+              try:
+                  open('/tmp/hls_error.txt', 'w').write(fa)
+              except Exception:
+                  pass
+              print('HLS_ERROR:', msg)
+              sys.exit(code)
+          def fetch_text(u):
+              sp = urllib.parse.urlsplit(u)
+              req = urllib.request.Request(u, headers={**UA, 'Referer': sp.scheme + '://' + sp.netloc + '/'})
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return r.read().decode('utf-8', 'replace'), r.geturl()
+          def key_of(line):
+              m = re.search(r'METHOD=([A-Z0-9\-]+)', line)
+              method = m.group(1) if m else 'NONE'
+              if method == 'NONE':
+                  return None
+              if method != 'AES-128':
+                  fail('unsupported key method ' + method, 3, 'این استریم رمزنگاری DRM دارد و پشتیبانی نمی‌شود')
+              um = re.search(r'URI="([^"]+)"', line)
+              return um.group(1) if um else None
+          text, base = fetch_text(SRC)
+          if not text.lstrip().startswith('#EXTM3U'):
+              fail('source is not an HLS playlist', 1, 'این لینک پلی‌لیست HLS نیست')
+          if '#EXT-X-STREAM-INF' in text:
+              lines = text.splitlines()
+              best = None; bestbw = -1; pending = None
+              for ln in lines:
+                  if ln.startswith('#EXT-X-STREAM-INF'):
+                      bm = re.search(r'BANDWIDTH=(\d+)', ln)
+                      pending = int(bm.group(1)) if bm else 0
+                  elif ln.strip() and not ln.startswith('#'):
+                      if pending is not None and pending > bestbw:
+                          bestbw = pending; best = ln.strip()
+                      pending = None
+              if not best:
+                  fail('no variant in master playlist', 1, 'نسخه‌ای در پلی‌لیست اصلی پیدا نشد')
+              text, base = fetch_text(urllib.parse.urljoin(base, best))
+              if not text.lstrip().startswith('#EXTM3U'):
+                  fail('variant is not a playlist', 1, 'این لینک پلی‌لیست HLS نیست')
+          if '#EXT-X-ENDLIST' not in text:
+              fail('live stream (no ENDLIST)', 4, 'پخش زنده پشتیبانی نمی‌شود؛ فقط ویدیوهای آماده (VOD)')
+          os.makedirs('/tmp/hls', exist_ok=True)
+          seg_urls_raw = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith('#')]
+          if '#EXT-X-BYTERANGE' in text or (len(seg_urls_raw) > 1 and len(set(seg_urls_raw)) == 1):
+              open('/tmp/hls/byterange.url', 'w').write(urllib.parse.urljoin(base, seg_urls_raw[0]))
+              print('hls plan: byterange single-file')
+              sys.exit(0)
+          segs = []; keys = {}; out = []
+          for ln in text.splitlines():
+              t = ln.strip()
+              if t.startswith('#EXT-X-KEY:'):
+                  ku = key_of(t)
+                  if ku:
+                      if ku not in keys:
+                          name = 'key.bin' if not keys else 'key%d.bin' % len(keys)
+                          keys[ku] = name
+                          open('/tmp/hls/dlkey_' + name, 'w').write(urllib.parse.urljoin(base, ku))
+                      ln = ln.replace('URI="' + ku + '"', 'URI="' + keys[ku] + '"')
+                  out.append(ln); continue
+              if t.startswith('#EXT-X-MAP:'):
+                  um = re.search(r'URI="([^"]+)"', t)
+                  if um:
+                      name = 'init.mp4' if '.mp4' in um.group(1) else 'init.bin'
+                      segs.append({'url': urllib.parse.urljoin(base, um.group(1)), 'name': name})
+                      ln = ln.replace('URI="' + um.group(1) + '"', 'URI="' + name + '"')
+                  out.append(ln); continue
+              if t and not t.startswith('#'):
+                  name = 'seg%05d' % len(segs)
+                  mm = re.search(r'\.([a-z0-9]{2,4})([?#]|$)', t.lower())
+                  ext = '.ts'
+                  if mm and mm.group(1) in ('m4s', 'mp4', 'aac', 'ts'):
+                      ext = '.' + mm.group(1)
+                  segs.append({'url': urllib.parse.urljoin(base, t), 'name': name + ext})
+                  out.append(name + ext); continue
+              out.append(ln)
+          if not segs:
+              fail('no segments in playlist', 1, 'سگمنتی در پلی‌لیست پیدا نشد')
+          open('/tmp/hls/local.m3u8', 'w').write('\n'.join(out) + '\n')
+          open('/tmp/hls/urls.txt', 'w').write('\n'.join(sg['url'] for sg in segs) + '\n')
+          open('/tmp/hls/names.txt', 'w').write('\n'.join(sg['name'] for sg in segs) + '\n')
+          print('hls plan: segments=%d keys=%d' % (len(segs), len(keys)))
+          PYEOF
+            if [ -f /tmp/hls/byterange.url ]; then
+              echo "hls byterange playlist: remux via ffmpeg directly"
+              if ffmpeg -v error -referer "$SRC_REF" -i "$SRC" -c copy -bsf:a aac_adtstoasc -f mp4 /tmp/video.bin -y || ffmpeg -v error -i "$SRC" -c copy -bsf:a aac_adtstoasc -f mp4 /tmp/video.bin -y || ffmpeg -v error -i "$SRC" -c:v libx264 -preset veryfast -c:a aac -f mp4 /tmp/video.bin -y; then
+                echo "hls byterange remux ok"
+              else
+                echo "hls byterange remux failed"; exit 1
+              fi
+              if [ ! -s /tmp/video.bin ]; then echo "hls output empty"; exit 1; fi
+              HDUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 /tmp/video.bin 2>/dev/null || echo "")
+              if [ -z "$HDUR" ]; then echo "hls output has no duration"; exit 1; fi
+              echo "hls done: $(stat -c %s /tmp/video.bin) bytes, duration $HDUR"
+              HLS_DONE=1
+            else
+            for kf in /tmp/hls/dlkey_*; do
+              [ -f "$kf" ] || continue
+              kn=${kf##*dlkey_}
+              KURL=$(cat "$kf")
+              curl -fsSL --retry 3 -e "$(ref_for "$KURL")" -o "/tmp/hls/$kn" "$KURL" || { echo "hls key download failed"; exit 1; }
+            done
+            if ! command -v aria2c >/dev/null 2>&1; then sudo apt-get update -qq >/dev/null 2>&1 || true; sudo apt-get install -y -qq aria2 >/dev/null 2>&1 || true; fi
+            DL_OK=0
+            if command -v aria2c >/dev/null 2>&1; then
+              python3 - <<'PYEOF'
+          import urllib.parse
+          urls = [l.rstrip('\n') for l in open('/tmp/hls/urls.txt')]
+          names = [l.rstrip('\n') for l in open('/tmp/hls/names.txt')]
+          with open('/tmp/hls/aria.txt', 'w') as f:
+              for u, n in zip(urls, names):
+                  sp = urllib.parse.urlsplit(u)
+                  f.write(u + '\n  out=' + n + '\n  dir=/tmp/hls\n  referer=' + sp.scheme + '://' + sp.netloc + '/\n')
+          PYEOF
+              if aria2c -i /tmp/hls/aria.txt -j 32 --max-connection-per-server=4 --retry-wait=2 --max-tries=5 --console-log-level=warn --summary-interval=0; then DL_OK=1; fi
+            fi
+            if [ "$DL_OK" != "1" ]; then
+              paste /tmp/hls/urls.txt /tmp/hls/names.txt | tr '\t' ' ' | xargs -P 32 -n 2 sh -c 'R=$(printf %s "$0" | sed -E "s#^(https?://[^/]+).*#\1/#"); curl -fsSL --retry 5 --retry-delay 1 -e "$R" -o "/tmp/hls/$1" "$0"' || { echo "hls segment download failed"; exit 1; }
+            fi
+            while IFS= read -r n; do
+              if [ ! -s "/tmp/hls/$n" ]; then echo "missing segment $n"; exit 1; fi
+            done < /tmp/hls/names.txt
+            if ffmpeg -v error -allowed_extensions ALL -i /tmp/hls/local.m3u8 -c copy -bsf:a aac_adtstoasc -f mp4 /tmp/video.bin -y || ffmpeg -v error -allowed_extensions ALL -i /tmp/hls/local.m3u8 -c:v libx264 -preset veryfast -c:a aac -f mp4 /tmp/video.bin -y; then
+              echo "hls remux ok"
+            else
+              echo "hls remux failed"; exit 1
+            fi
+            if [ ! -s /tmp/video.bin ]; then echo "hls output empty"; exit 1; fi
+            HDUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 /tmp/video.bin 2>/dev/null || echo "")
+            if [ -z "$HDUR" ]; then echo "hls output has no duration"; exit 1; fi
+            echo "hls done: $(stat -c %s /tmp/video.bin) bytes, duration $HDUR"
+            HLS_DONE=1
+            fi
+          fi
+          if [ "$HLS_DONE" != "1" ]; then
+          DL_T0=$(date +%s)
+          TOTAL=0; RANGED=0
+          HTTP_CODE=$(curl -sSL -e "$SRC_REF" -D /tmp/dl_headers.txt -r 0-0 -o /dev/null -w '%{http_code}' "$SRC" || true)
+          HTTP_CODE=${HTTP_CODE:-000}
+          CR=$(grep -i '^Content-Range:' /tmp/dl_headers.txt 2>/dev/null | tail -1 || true)
+          if [ "$HTTP_CODE" = "206" ] && [ -n "$CR" ]; then
+            T=$(printf '%s' "$CR" | sed -E 's#.*/##' | tr -dc '0-9')
+            if [ -n "$T" ] && [ "$T" -gt 0 ] 2>/dev/null; then TOTAL=$T; RANGED=1; fi
+          fi
+          echo "probe: http=$HTTP_CODE ranged=$RANGED total=$TOTAL"
+          dl_aria() {
+            aria2c -x 32 -s 32 -k 4M --max-connection-per-server=32 --min-split-size=1M \
+              --referer="$SRC_REF" \
+              --file-allocation=none --auto-file-renaming=false --allow-overwrite=true \
+              --retry-wait=2 --max-tries=5 --connect-timeout=15 --timeout=120 \
+              --summary-interval=0 --console-log-level=warn \
+              -d /tmp -o video.bin "$SRC"
+          }
+          dl_chunks() {
+            local n cs
+            n=$(( (TOTAL + 4194303) / 4194304 )); if [ "$n" -gt 64 ]; then n=64; fi; if [ "$n" -lt 1 ]; then n=1; fi
+            cs=$(( (TOTAL + n - 1) / n ))
+            CHUNK_SIZE=$cs; export CHUNK_SIZE TOTAL SRC SRC_REF
+            rm -rf /tmp/vparts && mkdir -p /tmp/vparts
+            fetch_chunk() {
+              local i=$1 s e
+              s=$(( i * CHUNK_SIZE )); e=$(( s + CHUNK_SIZE - 1 ))
+              if [ "$e" -ge "$TOTAL" ]; then e=$(( TOTAL - 1 )); fi
+              curl -fsSL -e "$SRC_REF" --retry 5 --retry-delay 1 -r "${s}-${e}" -o "/tmp/vparts/$(printf %04d "$i")" "$SRC"
+            }
+            export -f fetch_chunk
+            seq 0 $(( n - 1 )) | xargs -P 32 -I IDX bash -c 'fetch_chunk IDX' || return 1
+            cat /tmp/vparts/* > /tmp/video.bin
+          }
+          rm -f /tmp/video.bin /tmp/video.bin.aria2
+          DL_METHOD=""
+          if [ "$RANGED" = "1" ]; then
+            if ! command -v aria2c >/dev/null 2>&1; then sudo apt-get update -qq >/dev/null 2>&1 || true; sudo apt-get install -y -qq aria2 >/dev/null 2>&1 || true; fi
+            if command -v aria2c >/dev/null 2>&1; then
+              if dl_aria; then DL_METHOD=aria2c; fi
+            fi
+            if [ -z "$DL_METHOD" ]; then if dl_chunks; then DL_METHOD=chunks; fi; fi
+            SZ=$(stat -c %s /tmp/video.bin 2>/dev/null || echo 0)
+            if [ "$SZ" != "$TOTAL" ]; then
+              echo "size mismatch after $DL_METHOD (got $SZ want $TOTAL); retrying with the other method"
+              rm -f /tmp/video.bin /tmp/video.bin.aria2; DL_METHOD=""
+              if dl_chunks; then DL_METHOD=chunks; elif dl_aria; then DL_METHOD=aria2c; fi
+              SZ=$(stat -c %s /tmp/video.bin 2>/dev/null || echo 0)
+              if [ "$SZ" != "$TOTAL" ]; then echo "download size mismatch: got $SZ want $TOTAL"; exit 1; fi
+            fi
+          else
+            curl -fL -e "$SRC_REF" -C - --retry 3 --retry-delay 2 -o /tmp/video.bin "$SRC" || { echo "single-stream download failed"; exit 1; }
+            DL_METHOD=single
+          fi
+          SIZE=$(stat -c %s /tmp/video.bin)
+          DL_T1=$(date +%s)
+          echo "download done: method=$DL_METHOD size=$SIZE elapsed=$((DL_T1-DL_T0))s"
+          fi
+          if [ "$HLS_DONE" = "1" ]; then
+            SIZE=$(stat -c %s /tmp/video.bin)
+          fi
+          echo "downloaded: $SIZE bytes"
+          if [ "$SIZE" -eq 0 ]; then echo "empty file"; exit 1; fi
+          if [ "$SIZE" -gt 524288000 ]; then echo "over 500MB cap"; exit 1; fi
+          MIME=$(file -b --mime-type /tmp/video.bin || echo "video/mp4")
+          case "$MIME" in video/*) ;; *) MIME="video/mp4" ;; esac
+          TS=$(( $(date +%s) * 1000 ))
+          DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 /tmp/video.bin 2>/dev/null || echo "")
+          DURINT=0
+          if [ -n "$DUR" ]; then DURINT=$(printf "%.0f" "$DUR" 2>/dev/null || echo 0); fi
+          THUMB="media/$ITEM.thumb.jpg"
+          rm -f "$THUMB"
+          if [ -f /tmp/yt_thumb.jpg ]; then cp /tmp/yt_thumb.jpg "$THUMB"; echo "youtube thumbnail saved as $THUMB"; fi
+          if [ ! -f "$THUMB" ] && [ -n "$DUR" ]; then
+            DURINT=$(printf "%.0f" "$DUR" 2>/dev/null || echo 0)
+            BESTSEEK=""; BESTLUMA=-1; CHOSENSEEK=""
+            for PCT in 10 25 40 55 70 85; do
+              SEEKC=$(awk -v d="$DUR" -v p="$PCT" 'BEGIN{printf "%.2f", d*p/100}')
+              if ffmpeg -v error -ss "$SEEKC" -i /tmp/video.bin -frames:v 1 -vf scale=16:16 -pix_fmt gray -f rawvideo /tmp/luma.raw -y 2>/dev/null && [ -s /tmp/luma.raw ]; then
+                STATS=$(od -An -tu1 -v /tmp/luma.raw | awk '{for(i=1;i<=NF;i++){s+=$i;c++;if($i>m)m=$i}} END{printf "%d %d", (c?s/c:0), m}')
+                MEAN=${STATS%% *}; MAXL=${STATS##* }
+                echo "thumb candidate ${PCT}% (${SEEKC}s): mean=$MEAN max=$MAXL"
+                if [ "$MEAN" -ge 20 ] && [ "$MAXL" -gt 40 ]; then CHOSENSEEK="$SEEKC"; break; fi
+                if [ "$MEAN" -gt "$BESTLUMA" ]; then BESTLUMA="$MEAN"; BESTSEEK="$SEEKC"; fi
+              fi
+            done
+            SEEK="${CHOSENSEEK:-${BESTSEEK:-$(awk -v d="$DUR" 'BEGIN{printf "%.2f", d*0.1}')}}" 
+            if ffmpeg -v error -ss "$SEEK" -i /tmp/video.bin -frames:v 1 -vf scale=640:-2 -q:v 4 "$THUMB" -y && [ -s "$THUMB" ]; then
+              echo "thumb extracted at ${SEEK}s of ${DUR}s"
+            else
+              rm -f "$THUMB"; echo "thumb extraction failed; continuing without thumb"
+            fi
+          fi
+          BLURB64=""
+          if [ -f "$THUMB" ]; then
+            if ffmpeg -v error -i "$THUMB" -vf scale=32:-1 -q:v 12 /tmp/tiny.jpg -y && [ -s /tmp/tiny.jpg ]; then
+              BLURB64=$(base64 -w0 /tmp/tiny.jpg)
+              if [ ${#BLURB64} -gt 12000 ]; then BLURB64=""; fi
+              echo "blur b64: ${#BLURB64} chars"
+            fi
+          fi
+          PREVIEW=""
+          if python3 /tmp/gen_preview.py /tmp/video.bin "media/$ITEM.preview.gif"; then
+            PREVIEW="media/$ITEM.preview.gif"
+          else
+            echo "preview generation failed; continuing without preview"
+            rm -f "media/$ITEM.preview.gif"
+          fi
+          TP=$(( (SIZE + PART - 1) / PART ))
+          rm -rf /tmp/chunks && mkdir -p /tmp/chunks
+          split -b $PART -d -a 3 /tmp/video.bin /tmp/chunks/p
+          STORED=0
+          i=0
+          for f in /tmp/chunks/p*; do
+            name=$(printf "p%03d.part" $i)
+            sz=$(stat -c %s "$f")
+            if [ -f "$DIR/$name" ] && [ "$(stat -c %s "$DIR/$name")" = "$sz" ]; then
+              echo "skip existing $name"
+            else
+              cp "$f" "$DIR/$name"
+            fi
+            STORED=$((STORED + sz))
+            i=$((i+1))
+            if [ $((i % 12)) -eq 0 ]; then
+              echo "{\"total\":$SIZE,\"stored\":$STORED,\"mime\":\"$MIME\",\"parts\":$i,\"parts_total\":$TP}" > "progress/$JOB.json"
+              git add "$DIR" "progress/$JOB.json"
+              if ! git diff --cached --quiet; then
+                git commit -m "upload $ITEM parts up to $i"
+                ok=0
+                for try in $(seq 1 10); do
+                  gf origin main || true
+                  git rebase origin/main || git rebase --abort || true
+                  if gp; then ok=1; break; fi
+                  echo "batch push attempt $try rejected (concurrent writers race), retrying with jitter"
+                  sleep $((1 + RANDOM % 6))
+                done
+                if [ "$ok" = "0" ]; then echo "batch push failed"; exit 1; fi
+              fi
+            fi
+          done
+          python3 - "$DIR" "$ITEM" "$MIME" "$SIZE" "$SRC" "$TS" "$THUMB" "$DURINT" "$PREVIEW" <<'PYEOF'
+          import json, os, sys
+          d, item, mime, size, src, ts = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5], int(sys.argv[6])
+          thumb = sys.argv[7] if len(sys.argv) > 7 else ""
+          dur = int(sys.argv[8]) if len(sys.argv) > 8 and sys.argv[8] else 0
+          preview = sys.argv[9] if len(sys.argv) > 9 else ""
+          parts = []
+          for name in sorted(os.listdir(d)):
+              if name.endswith(".part"):
+                  parts.append({"path": d + "/" + name, "size": os.path.getsize(os.path.join(d, name))})
+          man = {"id": item, "kind": "video", "mime": mime, "size": size, "parts": parts, "source": src, "created_at": ts}
+          try:
+              _y = json.load(open("/tmp/yt_meta.json")); man.update({k: _y[k] for k in ("title", "channel", "yt_id") if _y.get(k)})
+          except Exception:
+              pass
+          if thumb and os.path.exists(thumb):
+              man["thumb"] = thumb
+          if dur:
+              man["dur"] = dur
+          if preview and os.path.exists(preview):
+              man["preview"] = preview
+          open("media/%s.json" % item, "w").write(json.dumps(man, indent=1))
+          print("manifest parts:", len(parts))
+          PYEOF
+          pushed=0
+          for try in $(seq 1 10); do
+            gf origin main || true
+            git show origin/main:index.json > /tmp/index.json || echo '{"photos":[]}' > /tmp/index.json
+            python3 - "$ITEM" "$MIME" "$SIZE" "$SRC" "$TS" "$THUMB" "$DURINT" "$BLURB64" "$PREVIEW" <<'PYEOF'
+          import json, os, sys
+          item, mime, size, src, ts = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], int(sys.argv[5])
+          thumb = sys.argv[6] if len(sys.argv) > 6 else ""
+          dur = int(sys.argv[7]) if len(sys.argv) > 7 and sys.argv[7] else 0
+          blur = sys.argv[8] if len(sys.argv) > 8 else ''
+          preview = sys.argv[9] if len(sys.argv) > 9 else ''
+          idx = json.load(open("/tmp/index.json"))
+          man = json.load(open("media/%s.json" % item))
+          if not any(p.get("id") == item for p in idx["photos"]):
+              entry = {"id": item, "kind": "video", "mime": mime, "size": size, "manifest": "media/%s.json" % item, "parts": len(man["parts"]), "source": src, "created_at": ts}
+              try:
+                  _y = json.load(open("/tmp/yt_meta.json")); entry.update({k: _y[k] for k in ("title", "channel", "yt_id") if _y.get(k)})
+              except Exception:
+                  pass
+              if thumb and os.path.exists(thumb):
+                  entry["thumb"] = thumb
+              if dur:
+                  entry["dur"] = dur
+              if blur:
+                  entry["blur"] = blur
+              if preview and os.path.exists(preview):
+                  entry["preview"] = preview
+              idx["photos"].insert(0, entry)
+          json.dump(idx, open("/tmp/index_new.json", "w"), indent=1, ensure_ascii=False)
+          PYEOF
+            echo "{\"total\":$SIZE,\"stored\":$SIZE,\"mime\":\"$MIME\",\"status\":\"done\",\"parts\":$TP,\"parts_total\":$TP}" > "progress/$JOB.json"
+            add_blob() { if [ -f "$1" ]; then local bs; bs=$(git hash-object -w "$1"); git update-index --add --cacheinfo "100644,$bs,$2"; fi; }
+            export GIT_INDEX_FILE=/tmp/hg_idx_upload
+            rm -f "$GIT_INDEX_FILE"
+            git read-tree origin/main
+            for f in "$DIR"/*; do add_blob "$f" "$f"; done
+            add_blob "media/$ITEM.json" "media/$ITEM.json"
+            [ -n "$SKIP_INDEX" ] || add_blob "/tmp/index_new.json" "index.json"
+            add_blob "progress/$JOB.json" "progress/$JOB.json"
+            if [ -f "$THUMB" ]; then add_blob "$THUMB" "$THUMB"; fi
+            if [ -n "$PREVIEW" ] && [ -f "$PREVIEW" ]; then add_blob "$PREVIEW" "$PREVIEW"; fi
+            TREE=$(git write-tree)
+            if [ "$TREE" = "$(git rev-parse origin/main^{tree})" ]; then pushed=1; unset GIT_INDEX_FILE; break; fi
+            COMMIT=$(git commit-tree "$TREE" -p origin/main -m "add video $ITEM")
+            unset GIT_INDEX_FILE
+            if gp origin "$COMMIT:main"; then pushed=1; break; fi
+            echo "push raced, retrying with jitter"
+            sleep $((1 + RANDOM % 6))
+          done
+          if [ "$pushed" = "0" ]; then echo "final push failed"; exit 1; fi
+          echo "done: $ITEM ($SIZE bytes)"
+      - name: Export entry (shard mode)
+        if: ${{ inputs.skip_index != '' && inputs.mode != 'preview' }}
+        env:
+          ITEM: ${{ inputs.item }}
+          JOB: ${{ inputs.job }}
+        run: |
+          set -euo pipefail
+          git config user.name "hot-gallery"
+          git config user.email "actions@users.noreply.github.com"
+          . /tmp/git-safe.sh
+          python3 - <<'PYEOF'
+          import json
+          idx = json.load(open("/tmp/index_new.json"))
+          entry = idx["photos"][0]
+          json.dump(entry, open("/tmp/entry.json", "w"), ensure_ascii=False)
+          print("entry extracted for", entry["id"])
+          PYEOF
+          pushed=0
+          for try in $(seq 1 10); do
+            gf origin main || true
+            git show "origin/main:progress/$JOB.json" > /tmp/prog.json
+            python3 - <<'PYEOF'
+          import json
+          p = json.load(open("/tmp/prog.json"))
+          p["entry"] = json.load(open("/tmp/entry.json"))
+          json.dump(p, open("/tmp/prog_new.json", "w"), ensure_ascii=False)
+          print("entry merged into progress")
+          PYEOF
+            BLOB=$(git hash-object -w /tmp/prog_new.json)
+            export GIT_INDEX_FILE=/tmp/hg_idx_export
+            rm -f "$GIT_INDEX_FILE"
+            git read-tree origin/main
+            git update-index --add --cacheinfo "100644,$BLOB,progress/$JOB.json"
+            TREE=$(git write-tree)
+            if [ "$TREE" = "$(git rev-parse origin/main^{tree})" ]; then pushed=1; unset GIT_INDEX_FILE; break; fi
+            COMMIT=$(git commit-tree "$TREE" -p origin/main -m "entry $ITEM")
+            unset GIT_INDEX_FILE
+            if gp origin "$COMMIT:main"; then pushed=1; break; fi
+            echo "export push raced, retrying with jitter"
+            sleep $((1 + RANDOM % 6))
+          done
+          if [ "$pushed" = "0" ]; then echo "export entry push failed"; exit 1; fi
+          echo "exported entry: $ITEM"
+      - name: Mark failed
+        if: ${{ failure() && inputs.mode != 'preview' }}
+        env:
+          JOB: ${{ inputs.job }}
+        run: |
+          git config user.name "hot-gallery"
+          git config user.email "actions@users.noreply.github.com"
+          . /tmp/git-safe.sh
+          mkdir -p progress
+          python3 - <<'PYEOF'
+          import json, os
+          err = ""
+          try:
+              err = open("/tmp/hls_error.txt").read().strip()
+          except Exception:
+              pass
+          d = {"status": "failed"}
+          if err:
+              d["error"] = err
+          try:
+              tail = open("/tmp/hg_step.log").read()[-2500:]
+              if tail.strip():
+                  d["log"] = tail
+          except Exception:
+              pass
+          os.makedirs("progress", exist_ok=True)
+          open("progress/%s.json" % os.environ.get("JOB", "job"), "w").write(json.dumps(d, ensure_ascii=False))
+          PYEOF
+          git add "progress/$JOB.json" || true
+          git commit -m "upload $JOB failed" || true
+          gp || { gf origin main || true; git rebase origin/main || git rebase --abort || true; gp || true; }

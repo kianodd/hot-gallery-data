@@ -1,0 +1,144 @@
+name: hg-record
+run-name: hg-record-${{ inputs.job }}
+on:
+  workflow_dispatch:
+    inputs:
+      page:
+        description: "Tube page URL or player URL"
+        required: true
+        type: string
+      item:
+        description: "Item id"
+        required: true
+        type: string
+      job:
+        description: "Queue job id"
+        required: true
+        type: string
+      maxsec:
+        description: "Record only first N seconds (0 = full)"
+        required: false
+        type: string
+        default: "0"
+permissions:
+  contents: write
+concurrency:
+  group: hg-upload-${{ inputs.item }}
+  cancel-in-progress: false
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout (sparse)
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            index.json
+            media/${{ inputs.item }}
+            media/${{ inputs.item }}.json
+            progress
+            scripts
+          sparse-checkout-cone-mode: false
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install recorder deps
+        working-directory: scripts
+        run: npm install --no-audit --no-fund
+      - name: Record and upload in 1MB parts
+        env:
+          SRC: ${{ inputs.page }}
+          ITEM: ${{ inputs.item }}
+          JOB: ${{ inputs.job }}
+          MAXSEC: ${{ inputs.maxsec }}
+        run: |
+          set -euo pipefail
+          git config user.name "hot-gallery"
+          git config user.email "actions@users.noreply.github.com"
+          PAGE_URL="$SRC" MAXSEC="${MAXSEC:-0}" OUT=/tmp/video.bin node scripts/record.js
+          PART=1048576
+          DIR="media/$ITEM"
+          mkdir -p "$DIR" progress
+          SIZE=$(stat -c %s /tmp/video.bin)
+          echo "recorded: $SIZE bytes"
+          if [ "$SIZE" -eq 0 ]; then echo "empty file"; exit 1; fi
+          if [ "$SIZE" -gt 524288000 ]; then echo "over 500MB cap"; exit 1; fi
+          MIME=$(file -b --mime-type /tmp/video.bin || echo "video/mp4")
+          case "$MIME" in video/*) ;; *) MIME="video/mp4" ;; esac
+          TS=$(( $(date +%s) * 1000 ))
+          rm -rf /tmp/chunks && mkdir -p /tmp/chunks
+          split -b $PART -d -a 3 /tmp/video.bin /tmp/chunks/p
+          STORED=0
+          i=0
+          for f in /tmp/chunks/p*; do
+            name=$(printf "p%03d.part" $i)
+            sz=$(stat -c %s "$f")
+            if [ -f "$DIR/$name" ] && [ "$(stat -c %s "$DIR/$name")" = "$sz" ]; then
+              echo "skip existing $name"
+            else
+              cp "$f" "$DIR/$name"
+            fi
+            STORED=$((STORED + sz))
+            i=$((i+1))
+            if [ $((i % 25)) -eq 0 ]; then
+              echo "{\"total\":$SIZE,\"stored\":$STORED,\"mime\":\"$MIME\"}" > "progress/$JOB.json"
+              git add "$DIR" "progress/$JOB.json"
+              if ! git diff --cached --quiet; then
+                git commit -m "record $ITEM parts up to $i"
+                ok=0
+                for try in 1 2 3; do
+                  if git push; then ok=1; break; fi
+                  git pull --rebase origin main || git rebase --abort || true
+                done
+                if [ "$ok" = "0" ]; then echo "batch push failed"; exit 1; fi
+              fi
+            fi
+          done
+          python3 - "$DIR" "$ITEM" "$MIME" "$SIZE" "$SRC" "$TS" <<'PYEOF'
+          import json, os, sys
+          d, item, mime, size, src, ts = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5], int(sys.argv[6])
+          parts = []
+          for name in sorted(os.listdir(d)):
+              if name.endswith(".part"):
+                  parts.append({"path": d + "/" + name, "size": os.path.getsize(os.path.join(d, name))})
+          man = {"id": item, "kind": "video", "mime": mime, "size": size, "parts": parts, "source": src, "created_at": ts}
+          open("media/%s.json" % item, "w").write(json.dumps(man, indent=1))
+          print("manifest parts:", len(parts))
+          PYEOF
+          pushed=0
+          for try in 1 2 3 4 5; do
+            if [ "$try" -gt 1 ]; then git reset --soft origin/main; fi
+            git fetch origin main
+            git show origin/main:index.json > /tmp/index.json
+            python3 - "$ITEM" "$MIME" "$SIZE" "$SRC" "$TS" <<'PYEOF'
+          import json, sys
+          item, mime, size, src, ts = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], int(sys.argv[5])
+          idx = json.load(open("/tmp/index.json"))
+          man = json.load(open("media/%s.json" % item))
+          if not any(p.get("id") == item for p in idx["photos"]):
+              idx["photos"].insert(0, {"id": item, "kind": "video", "mime": mime, "size": size, "manifest": "media/%s.json" % item, "parts": len(man["parts"]), "source": src, "created_at": ts})
+          json.dump(idx, open("index.json", "w"), indent=1, ensure_ascii=False)
+          PYEOF
+            echo "{\"total\":$SIZE,\"stored\":$SIZE,\"mime\":\"$MIME\",\"status\":\"done\"}" > "progress/$JOB.json"
+            git add "$DIR" "media/$ITEM.json" index.json "progress/$JOB.json"
+            if git diff --cached --quiet; then pushed=1; break; fi
+            git commit -m "add recorded video $ITEM"
+            if git push; then pushed=1; break; fi
+            echo "push raced, retrying"
+          done
+          if [ "$pushed" = "0" ]; then echo "final push failed"; exit 1; fi
+          echo "done: $ITEM ($SIZE bytes)"
+      - name: Mark failed
+        if: failure()
+        env:
+          JOB: ${{ inputs.job }}
+        run: |
+          git config user.name "hot-gallery"
+          git config user.email "actions@users.noreply.github.com"
+          mkdir -p progress
+          echo '{"status":"failed"}' > "progress/$JOB.json"
+          git add "progress/$JOB.json" || true
+          git commit -m "record $JOB failed" || true
+          git push || { git pull --rebase origin main || git rebase --abort || true; git push || true; }
