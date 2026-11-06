@@ -21,6 +21,16 @@ on:
         description: "Queue job id"
         required: true
         type: string
+      yt_height:
+        description: "youtube: max video height (default 360)"
+        required: false
+        default: "360"
+        type: string
+      yt_abrate:
+        description: "youtube: audio bitrate kbps (default 128)"
+        required: false
+        default: "128"
+        type: string
       skip_index:
         description: "1 = shard mode: commit media only, never index.json; the entry is exported in progress for the worker to merge into the main repo index"
         required: false
@@ -198,8 +208,11 @@ jobs:
           SRC: ${{ inputs.url }}
           ITEM: ${{ inputs.item }}
           JOB: ${{ inputs.job }}
+          YT_H: ${{ inputs.yt_height }}
+          YT_A: ${{ inputs.yt_abrate }}
         run: |
           set -euo pipefail
+          YT_H="${YT_H:-360}"; YT_A="${YT_A:-128}"
           # hg-v20 (یوتیوب): اول اینویدیوس (چند نمونه به‌ترتیب)، yt-dlp فقط آخرین راه‌حلِ محدود — دانلود با yt-dlp — ویدیو حداکثر 360p، صدا در خروجی نهایی AAC با بیت‌ریت 128k.
           # عنوان، نام کانال و آی‌دی در /tmp/yt_meta.json ذخیره می‌شود تا در مانیفست و ایندکس بنشیند؛
           # تامنیل رسمی یوتیوب هم به /tmp/yt_thumb.jpg می‌رود و جلوتر جای تامنیل فریمی را می‌گیرد.
@@ -230,20 +243,23 @@ jobs:
                       auds = [f for f in ad if str(f.get("type", "")).startswith("audio/")]
                       if not vids or not auds:
                           print(base, ": no adaptive formats"); continue
+                      YT_H = int(os.environ.get("YT_H") or 360)
+                      YT_A = int(os.environ.get("YT_A") or 128)
                       def pick_v(fs):
-                          for it in ("134", "18"):
-                              for f in fs:
-                                  if str(f.get("itag")) == it: return f
-                          c = [f for f in fs if f.get("qualityLabel") == "360p" and "mp4" in str(f.get("type"))]
-                          if c: return c[0]
-                          c = [f for f in fs if "mp4" in str(f.get("type")) and (f.get("qualityLabel") or "") <= "360p"]
-                          return c[0] if c else fs[0]
+                          def hgt(f):
+                              mm = re.match(r"(\d+)p", f.get("qualityLabel") or "")
+                              return int(mm.group(1)) if mm else 0
+                          mp4 = [f for f in fs if "mp4" in str(f.get("type"))]
+                          pool = mp4 or fs
+                          under = [f for f in pool if 0 < hgt(f) <= YT_H]
+                          if under: return max(under, key=hgt)
+                          over = [f for f in pool if hgt(f) > 0]
+                          if over: return min(over, key=hgt)
+                          return pool[0]
                       def pick_a(fs):
-                          for f in fs:
-                              if str(f.get("itag")) == "140": return f
                           mp = [f for f in fs if "mp4" in str(f.get("type"))]
-                          if mp: return min(mp, key=lambda f: abs(int(f.get("bitrate") or 0) - 128000))
-                          return fs[0]
+                          pool = mp or fs
+                          return min(pool, key=lambda f: abs(int(f.get("bitrate") or 0) - YT_A * 1000))
                       vf, af = pick_v(vids), pick_a(auds)
                       print(base, ": video itag", vf.get("itag"), vf.get("qualityLabel"), "| audio itag", af.get("itag"), af.get("bitrate"))
                       if not dl(vf["url"], "/tmp/yt_v.bin"): print(base, ": video download failed"); continue
@@ -279,7 +295,7 @@ jobs:
             python3 -m pip install --quiet --upgrade "yt-dlp[default]" || pip3 install --quiet --upgrade "yt-dlp[default]"
             export PATH="$HOME/.local/bin:$PATH"
             command -v yt-dlp
-            YTFMT='bestvideo[height<=360][vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[height<=360]+bestaudio/best[height<=360]/bestvideo+bestaudio/best'
+            YTFMT="bestvideo[height<=$YT_H][vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[height<=$YT_H]+bestaudio/best[height<=$YT_H]/bestvideo+bestaudio/best"
               for CLIENT in tv android_vr web_safari; do
                 echo "yt-dlp attempt: player_client=$CLIENT"
                 rm -f /tmp/ytv.mp4 /tmp/ytv.webm /tmp/ytv.mkv /tmp/ytv.info.json /tmp/ytv.jpg /tmp/ytv.webp /tmp/ytv.png
@@ -305,9 +321,9 @@ jobs:
             VCODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$YTRAW" 2>/dev/null || echo "")
             echo "yt video codec: $VCODEC"
             if [ "$VCODEC" = "h264" ]; then
-              ffmpeg -v error -i "$YTRAW" -c:v copy -c:a aac -b:a 128k -movflags +faststart -f mp4 /tmp/video.bin -y
+              ffmpeg -v error -i "$YTRAW" -c:v copy -c:a aac -b:a "${YT_A}k" -movflags +faststart -f mp4 /tmp/video.bin -y
             else
-              ffmpeg -v error -i "$YTRAW" -c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 128k -movflags +faststart -f mp4 /tmp/video.bin -y
+              ffmpeg -v error -i "$YTRAW" -c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a "${YT_A}k" -movflags +faststart -f mp4 /tmp/video.bin -y
             fi
             if [ ! -s /tmp/video.bin ]; then echo "youtube normalize failed"; exit 1; fi
             if [ -f /tmp/ytv.jpg ]; then ffmpeg -v error -i /tmp/ytv.jpg -vf scale=640:-2 -q:v 4 /tmp/yt_thumb.jpg -y || cp /tmp/ytv.jpg /tmp/yt_thumb.jpg || true; fi
